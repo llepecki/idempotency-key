@@ -7,6 +7,12 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/Dotnet.gitignore
 
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -52,3 +58,23 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Jetbrains Rider
+.idea/
+
+# MacOS
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# npm packages
+node_modules/
+
+# Scratchpad
+scratchpad.txt
+
+# SSL certificates for local development
+certs/*.key
+certs/*.p12

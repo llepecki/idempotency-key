@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/root/">
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="IdempotencyKey.csproj" />
+</Solution>

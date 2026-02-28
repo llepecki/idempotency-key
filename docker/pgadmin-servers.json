@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Idempotency (local)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "idempotency",
+      "Username": "idempotency",
+      "PassFile": "/pgpass",
+      "SSLMode": "prefer"
+    }
+  }
+}

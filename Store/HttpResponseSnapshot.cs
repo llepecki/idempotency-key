@@ -6,13 +6,12 @@ namespace IdempotencyKey.Store;
 /// Reconstructs a cached HTTP response from stored status code, headers, and body.
 /// Implements <see cref="IStatusCodeHttpResult"/> so the filter's 5xx check works on replay.
 /// </summary>
-public sealed class CachedResult(
-    int statusCode,
-    Dictionary<string, string[]> headers,
-    byte[] body) : IResult, IStatusCodeHttpResult
+public sealed class HttpResponseSnapshot(int statusCode, IReadOnlyDictionary<string, StringValues> headers, byte[] body) : IResult, IStatusCodeHttpResult
 {
     public int? StatusCode => statusCode;
-    public Dictionary<string, string[]> Headers => headers;
+
+    public IReadOnlyDictionary<string, StringValues> Headers => headers;
+
     public byte[] Body => body;
 
     public async Task ExecuteAsync(HttpContext httpContext)
@@ -21,7 +20,7 @@ public sealed class CachedResult(
 
         foreach (var (name, values) in headers)
         {
-            httpContext.Response.Headers[name] = new StringValues(values);
+            httpContext.Response.Headers.Append(name, values);
         }
 
         if (body.Length > 0)

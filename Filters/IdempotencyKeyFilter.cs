@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using IdempotencyKey.Store;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace IdempotencyKey.Filters;
 
@@ -15,12 +16,18 @@ namespace IdempotencyKey.Filters;
 //   6. Entry in-progress (409)     → 409 Conflict
 //   7. Lock acquired               → execute handler
 //      a. Handler throws           → Release; rethrow
-//      b. 5xx result               → Release; return 5xx
-//      c. non-5xx IResult          → Complete; return result
-//      d. non-IResult              → Release; throw InvalidOperationException
-public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) : IEndpointFilter
+//      b. non-IResult              → Release; throw IdempotencyFilterException
+//      c. Captured 5xx             → Release; return snapshot (not cached)
+//      d. Captured non-5xx         → Complete
+//         i.  Complete succeeded   → return snapshot
+//         ii. Complete threw       → Release; return 500 (idempotency persistence failure)
+public sealed class IdempotencyKeyFilter<TRequest>(
+    IIdempotencyKeyStore store,
+    IOptions<IdempotencyKeyOptions> options,
+    ILogger<IdempotencyKeyFilter<TRequest>> logger) : IEndpointFilter
 {
     private const string IdempotencyKeyHeaderName = "Idempotency-Key";
+    private const string IdempotentReplayed = "Idempotent-Replayed";
 
     public async ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
     {
@@ -34,14 +41,17 @@ public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) :
                 statusCode: error.Status);
         }
 
-        var request = context.GetArgument<TRequest>(0);
-        var requestHash = ComputeRequestHash(request);
+        var request = context.Arguments.OfType<TRequest>().FirstOrDefault()
+            ?? throw new IdempotencyFilterException(
+                $"IdempotencyKeyFilter<{typeof(TRequest).Name}> requires the endpoint to accept " +
+                $"a parameter of type {typeof(TRequest).Name}, but none was found.");
 
+        var requestHash = ComputeRequestHash(request);
         var acquireResult = await store.TryAcquire(key.Value, requestHash, httpContext.RequestAborted);
 
         if (!acquireResult.IsAcquired)
         {
-            if (acquireResult.Entry?.Result is null)
+            if (acquireResult.Response is not { IsCompleted: true })
             {
                 return Results.Problem(
                     detail: "A request with this 'Idempotency-Key' is already being processed. Retry after it completes.",
@@ -49,7 +59,7 @@ public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) :
                     statusCode: StatusCodes.Status409Conflict);
             }
 
-            if (!string.Equals(acquireResult.Entry.RequestHash, requestHash, StringComparison.Ordinal))
+            if (!string.Equals(acquireResult.Response.RequestHash, requestHash, StringComparison.Ordinal))
             {
                 return Results.Problem(
                     detail: "The 'Idempotency-Key' was already used with a different request payload.",
@@ -57,9 +67,11 @@ public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) :
                     statusCode: StatusCodes.Status422UnprocessableEntity);
             }
 
-            return acquireResult.Entry.Result; // Replay cached result.
+            httpContext.Response.Headers[IdempotentReplayed] = "true";
+            return acquireResult.Response.Snapshot; // Replay cached result.
         }
 
+        var ownershipToken = acquireResult.OwnershipToken;
         object? result;
 
         try
@@ -68,29 +80,50 @@ public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) :
         }
         catch
         {
-            await store.Release(key.Value, httpContext.RequestAborted);
+            await store.Release(key.Value, ownershipToken, CancellationToken.None);
             throw;
         }
 
+        if (result is not IResult handlerResult)
+        {
+            await store.Release(key.Value, ownershipToken, CancellationToken.None);
+            throw new IdempotencyFilterException($"IdempotencyKeyFilter<{typeof(TRequest).Name}> requires the handler to return IResult, got: {result?.GetType().FullName ?? "null"}");
+        }
+
+        var snapshot = await CaptureResult(handlerResult, httpContext);
+
+        if (snapshot.Body.Length > options.Value.MaxCachedResponseBodySize)
+        {
+            logger.LogWarning(
+                "Response body for idempotency key '{Key}' exceeds MaxCachedResponseBodySize ({Size} > {Limit}). Skipping cache.",
+                key, snapshot.Body.Length, options.Value.MaxCachedResponseBodySize);
+            await store.Release(key.Value, ownershipToken, CancellationToken.None);
+            return snapshot;
+        }
+
         // Do not cache 5xx — they are transient; the client must be able to retry.
-        if (result is IStatusCodeHttpResult { StatusCode: >= 500 and <= 599 })
+        if (snapshot.StatusCode is >= 500 and <= 599)
         {
-            await store.Release(key.Value, httpContext.RequestAborted);
-            return result;
+            await store.Release(key.Value, ownershipToken, CancellationToken.None);
+            return snapshot;
         }
 
-        if (result is not IResult iResult)
+        try
         {
-            await store.Release(key.Value, httpContext.RequestAborted);
+            await store.Complete(key.Value, ownershipToken, snapshot, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to persist idempotency key '{Key}'", key);
+            await store.Release(key.Value, ownershipToken, CancellationToken.None);
 
-            throw new InvalidOperationException(
-                $"IdempotencyKeyFilter<{typeof(TRequest).Name}> requires the handler to return IResult. " +
-                $"Got: {result?.GetType().FullName ?? "null"}.");
+            return Results.Problem(
+                detail: "The response could not be persisted for idempotency. The operation may have completed. Retry with the same Idempotency-Key.",
+                title: "Idempotency Persistence Failure",
+                statusCode: StatusCodes.Status500InternalServerError);
         }
 
-        var cachedResult = await CaptureResultAsync(iResult, httpContext.RequestServices);
-        await store.Complete(key.Value, cachedResult, httpContext.RequestAborted);
-        return iResult;
+        return snapshot;
     }
 
     private static bool TryGetIdempotencyKey(
@@ -142,32 +175,38 @@ public sealed class IdempotencyKeyFilter<TRequest>(IIdempotencyKeyStore store) :
     }
 
     /// <summary>
-    /// Executes an <see cref="IResult"/> against a <see cref="DefaultHttpContext"/> to capture
-    /// the status code, response headers, and body bytes for storage.
-    /// Uses the request-scoped <paramref name="requestServices"/> to avoid captive dependency issues.
+    /// Executes an <see cref="IResult"/> against the real <see cref="HttpContext"/> with a
+    /// body-swapped <see cref="MemoryStream"/> to capture the status code, response headers,
+    /// and body bytes for storage. The original response body stream is restored in the finally
+    /// block, and headers/status are cleared to prevent duplication when the returned
+    /// <see cref="HttpResponseSnapshot"/> writes them again during the actual response.
     /// </summary>
-    private static async Task<CachedResult> CaptureResultAsync(IResult result, IServiceProvider requestServices)
+    private static async Task<HttpResponseSnapshot> CaptureResult(IResult result, HttpContext httpContext)
     {
+        var originalBody = httpContext.Response.Body;
         await using var memoryStream = new MemoryStream();
-        var captureContext = new DefaultHttpContext
+
+        try
         {
-            RequestServices = requestServices,
-            Response = { Body = memoryStream }
-        };
+            httpContext.Response.Body = memoryStream;
+            await result.ExecuteAsync(httpContext);
 
-        await result.ExecuteAsync(captureContext);
+            var statusCode = httpContext.Response.StatusCode;
+            var headers = httpContext.Response.Headers.ToDictionary();
+            var body = memoryStream.ToArray();
 
-        var statusCode = captureContext.Response.StatusCode;
-
-        var headers = new Dictionary<string, string[]>();
-        foreach (var (name, values) in captureContext.Response.Headers)
-        {
-            headers[name] = values.ToArray()!;
+            return new HttpResponseSnapshot(statusCode, headers, body);
         }
+        finally
+        {
+            httpContext.Response.Body = originalBody;
 
-        var body = memoryStream.ToArray();
-
-        return new CachedResult(statusCode, headers, body);
+            if (!httpContext.Response.HasStarted)
+            {
+                httpContext.Response.StatusCode = StatusCodes.Status200OK;
+                httpContext.Response.Headers.Clear();
+            }
+        }
     }
 
     // Fingerprint: SHA256 of JSON-serialized bound model arguments.

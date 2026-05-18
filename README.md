@@ -46,7 +46,7 @@ Filters/
   IdempotencyOptions.cs             — Configuration: Ttl (24h)
   IdempotencyFilter.cs              — Core IEndpointFilter: validation, locking, fingerprinting, replay
 Store/
-  IIdempotencyStore.cs              — Three-method lock protocol abstraction + IdempotencyEntry record
+  IIdempotencyStore.cs              — Three-method lock protocol abstraction + StoredResponse record
   InMemoryIdempotencyStore.cs       — ConcurrentDictionary implementation with passive TTL eviction
 ```
 
@@ -83,11 +83,12 @@ Run the same command again. The handler does not execute; the stored result is r
 ```
 HTTP/1.1 201 Created
 Location: /payments/<same-payment-id>
+Idempotent-Replayed: true
 
 {"paymentId":"...","amount":100.00,"currency":"USD","recipientId":"user-123","createdAt":"..."}
 ```
 
-The `paymentId` and `createdAt` are identical to path 1 — the response is replayed, not re-generated.
+The `paymentId` and `createdAt` are identical to path 1 — the response is replayed, not re-generated. The `Idempotent-Replayed: true` header signals that this is a cached replay, not a fresh execution.
 
 ### Path 3: missing header — 400 Bad Request
 
@@ -207,37 +208,38 @@ Two payments are created. The damage is done before `SetAsync` is ever called. N
 ```csharp
 // InMemoryIdempotencyStore.cs
 if (_store.TryAdd(key, sentinel))
-    return ValueTask.FromResult<(bool, IdempotencyEntry?)>((true, null));
+    return ValueTask.FromResult<(bool, StoredResponse?)>((true, null));
 ```
 
 The Redis equivalent is `SET key value NX PX ttlMs` (set-if-not-exists with TTL), which provides the same atomic guarantee across processes.
 
-**Complete:** transitions the entry from `null → CachedResult`. The filter captures the `IResult` into a `CachedResult` (status code, headers, body) before passing it to the store. The lock is relinquished; future requests see a completed result and replay it.
+**Complete:** transitions the entry from `null → HttpResponseSnapshot`. The filter captures the `IResult` into a `HttpResponseSnapshot` (status code, headers, body) before passing it to the store. The lock is relinquished; future requests see a completed result and replay it. `Complete` validates the ownership token — if the sentinel expired and was re-acquired by another request, the stale caller's `Complete` is a no-op.
 
-**Release:** removes the entry entirely. Used on 5xx responses, unhandled exceptions, and non-cacheable returns. Removal allows the client to retry: the next attempt re-acquires the lock cleanly.
+**Release:** removes the entry entirely. Used on 5xx responses, unhandled exceptions, and non-cacheable returns. Removal allows the client to retry: the next attempt re-acquires the lock cleanly. `Release` validates the ownership token — stale callers can't delete a re-acquired lock.
 
-**Lock is always released:** The filter wraps handler execution in a try/catch. Any unhandled exception calls `Release` before rethrowing, preventing a stuck lock.
+**Lock is always released:** The filter wraps handler execution in a try/catch. Any unhandled exception calls `Release` (with the ownership token) before rethrowing, preventing a stuck lock.
 
 ```csharp
 // IdempotencyFilter.cs
+var ownershipToken = acquireResult.OwnershipToken;
 try
 {
     result = await next(context);
 }
 catch
 {
-    await store.Release(key, httpContext.RequestAborted);
+    await store.Release(key, ownershipToken, httpContext.RequestAborted);
     throw;
 }
 ```
 
 ### 5.5 `Result == null` as the in-progress sentinel
 
-**Decision:** `IdempotencyEntry.Result == null` signals "lock held, result not yet stored."
+**Decision:** `StoredResponse.Result == null` signals "lock held, result not yet stored."
 
-**Rationale:** A separate enum field (e.g., `Status: Pending | Completed`) would require an additional property and a more complex update operation. Using `null` leverages the existing nullable `CachedResult?` field as a free state bit.
+**Rationale:** A separate enum field (e.g., `Status: Pending | Completed`) would require an additional property and a more complex update operation. Using `null` leverages the existing nullable `HttpResponseSnapshot?` field as a free state bit.
 
-`IdempotencyEntry` is an immutable record. `Complete` uses `AddOrUpdate` with a `with` expression to transition `null → CachedResult` atomically:
+`StoredResponse` is an immutable record. `Complete` uses `AddOrUpdate` with a `with` expression to transition `null → HttpResponseSnapshot` atomically:
 
 ```csharp
 // InMemoryIdempotencyStore.cs
@@ -291,11 +293,13 @@ if (result is IStatusCodeHttpResult { StatusCode: >= 500 and <= 599 })
 
 **Decision:** If the handler returns a non-`IResult` value (e.g., a plain C# object), the filter releases the lock and returns the result uncached.
 
-**Rationale:** ASP.NET Core Minimal APIs allow handlers to return plain objects (`return new PaymentResponse(...)`), which the framework serializes automatically. However, a plain `object?` reference cannot be re-executed later by the filter — the filter has no way to reproduce the serialized response from a stored `object?` without duplicating framework-internal serialization logic. Attempting to cache and replay raw objects would require reflection or a custom serializer, introducing complexity and fragility.
+**Rationale:** ASP.NET Core Minimal APIs allow handlers to return plain objects (`return new PaymentResponse(...)`), which the framework serializes automatically. However, a plain `object?` reference can't be re-executed later by the filter — the filter has no way to reproduce the serialized response from a stored `object?` without duplicating framework-internal serialization logic. Attempting to cache and replay raw objects would require reflection or a custom serializer, introducing complexity and fragility.
 
 The safe default is to release the lock: no retry protection, no replay, but also no risk of corrupting the response. This is a documented constraint.
 
 **Solution for handlers that must be idempotent:** return `Results.Ok(value)` instead of `value` directly. An `IResult` is a replayable unit of behavior by design.
+
+**Argument discovery:** The filter finds the request DTO using `context.Arguments.OfType<TRequest>().FirstOrDefault()` (type-based discovery), not by positional index. This means endpoint parameters can be reordered or have injected services preceding the DTO without breaking fingerprinting.
 
 ```csharp
 // Works: the filter can cache and replay this
@@ -323,7 +327,17 @@ return response;
 builder.Services.Configure<IdempotencyOptions>(o => o.Ttl = TimeSpan.FromHours(48));
 ```
 
-### 5.10 Passive TTL eviction (no background timer)
+### 5.10 Stale lock recovery via `LockTimeout`
+
+**Decision:** Sentinel entries (in-progress locks) are created with `ExpiresAt = now + LockTimeout` (default 5 minutes) instead of the full `Ttl`. `Complete` resets `ExpiresAt` to `now + Ttl` when transitioning sentinel to completed, so completed entries retain the full 24-hour window.
+
+**Problem:** If a request acquires the lock (inserts a sentinel with `Result == null`) and then the process crashes, the handler hangs, or `Release` is never called, the sentinel is never cleaned up. Without recovery, the key is permanently stuck returning 409 Conflict.
+
+**Solution:** By giving sentinels a short expiry, the existing expiry-based eviction naturally cleans them up. No special-case logic or separate background process is needed. A stale sentinel expires after `LockTimeout`, is evicted by the next `TryAcquire` sweep, and the client's retry re-acquires the lock cleanly.
+
+**Why 5 minutes?** Long enough that a slow-but-healthy handler does not have its lock stolen mid-execution. Short enough that a crashed process unblocks retries in a reasonable timeframe. Configurable via `IdempotencyKeyOptions.LockTimeout`.
+
+### 5.11 Passive TTL eviction (no background timer)
 
 **Decision:** Expired entries are swept on every `TryAcquire` call. There is no background `IHostedService` or timer.
 
@@ -342,13 +356,13 @@ private void EvictExpired()
 }
 ```
 
-`EvictExpired` is called at the top of `TryAcquire` — before the new sentinel is inserted. This ensures the store does not accumulate unbounded expired entries as long as new requests continue to arrive.
+`EvictExpired` is called at the top of `TryAcquire` — before the new sentinel is inserted. This ensures the store does not accumulate unbounded expired entries as long as new requests continue to arrive. Both stale sentinels (expired after `LockTimeout`) and completed entries (expired after `Ttl`) are evicted uniformly.
 
 **Not called in `Complete` or `Release`:** These are on the hot path (called immediately after handler execution). Eviction is a best-effort cleanup concern; adding an O(n) sweep to every response would increase tail latency unnecessarily.
 
 **Trade-off:** Memory is not reclaimed between `TryAcquire` calls. In a low-traffic API with a long TTL, entries can accumulate. For production with high key volume, a background `IHostedService` sweeping every few minutes, or a Redis-backed store with native TTL expiry, is more appropriate.
 
-### 5.11 `IIdempotencyStore` registered as a singleton
+### 5.12 `IIdempotencyStore` registered as a singleton
 
 **Decision:** `IIdempotencyStore` is registered with `AddSingleton`.
 
@@ -356,7 +370,7 @@ private void EvictExpired()
 
 **Implication for custom implementations:** Any class implementing `IIdempotencyStore` must be fully thread-safe. The in-memory implementation uses `ConcurrentDictionary` and relies on its atomic `TryAdd` and `AddOrUpdate` guarantees. A Redis implementation would rely on Redis's single-threaded command execution model for atomicity.
 
-### 5.12 RFC 9457 ProblemDetails for all error responses
+### 5.13 RFC 9457 ProblemDetails for all error responses
 
 **Decision:** All error responses use `Results.Problem(detail, statusCode)`, producing `application/problem+json` bodies per RFC 9457.
 
@@ -391,7 +405,7 @@ var userId = httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier)
 var scopedKey = $"{userId}:{key}";
 ```
 
-With scoping, `user-A:550e8400-...` and `user-B:550e8400-...` are independent entries. User B cannot observe or replay User A's result.
+With scoping, `user-A:550e8400-...` and `user-B:550e8400-...` are independent entries. User B can't observe or replay User A's result.
 
 ### 6.2 Redis-backed store
 
@@ -401,10 +415,10 @@ Redis is the standard choice. The three-method protocol maps directly to Redis c
 
 | Operation | In-memory | Redis |
 |---|---|---|
-| `TryAcquire` | `ConcurrentDictionary.TryAdd` | `SET key value NX PX ttlMs` |
-| `Complete` | `AddOrUpdate` (update only) | `SET key value XX` |
+| `TryAcquire` | `ConcurrentDictionary.TryAdd` (ExpiresAt = `now + LockTimeout`) | `SET key value NX PX lockTimeoutMs` |
+| `Complete` | `AddOrUpdate` (update only; resets ExpiresAt to `now + Ttl`) | `SET key value XX PXAT ttlMs` |
 | `Release` | `TryRemove` | `DEL key` |
-| TTL eviction | Passive sweep in `TryAcquire` | Redis native expiry (no sweep needed) |
+| TTL eviction | Passive sweep in `TryAcquire` (all expired entries) | Redis native expiry |
 | Distributed | No | Yes |
 | Persistent across restarts | No | Yes (with persistence enabled) |
 
@@ -416,15 +430,14 @@ To implement: create a class `RedisIdempotencyStore : IIdempotencyStore` using `
 
 ### 6.3 Response header signalling replays
 
-A common API convention is to set a response header when a cached result is being replayed, so clients can distinguish a fresh response from a replayed one. Stripe uses `Idempotent-Replayed: true`.
+When a cached result is replayed, the response includes the `Idempotent-Replayed: true` header. This follows the Stripe convention and allows clients to distinguish a fresh response from a cached replay.
 
-This is not implemented in the blueprint. To add it, modify the replay branch of `IdempotencyFilter.InvokeAsync`:
+The header is set in the replay branch of `IdempotencyKeyFilter.InvokeAsync`:
 
 ```csharp
-// Not implemented in this blueprint.
-// In the replay branch, before returning:
+// IdempotencyKeyFilter.cs
 httpContext.Response.Headers["Idempotent-Replayed"] = "true";
-return entry.Result;
+return acquireResult.Entry.Result; // Replay cached result.
 ```
 
 ---
@@ -441,8 +454,7 @@ The following are deliberately absent from this blueprint. Each is a real produc
 | Horizontal scaling / distributed locking | Same as persistence — requires Redis or equivalent. |
 | Background TTL eviction timer | Adds concurrency complexity. Passive eviction is correct for the single-process case. |
 | Observability (metrics, structured logs for replays) | Application-specific. Hooks belong in `IdempotencyFilter` at the replay and cache branches. |
-| `Idempotent-Replayed` response header | Minor addition. Pattern documented in section 6.3. |
-| Non-JSON / stream-based response support | `IResult` is the only replayable unit available to the filter. Stream responses cannot be cached without buffering. |
+| Non-JSON / stream-based response support | `IResult` is the only replayable unit available to the filter. Stream responses can't be cached without buffering. |
 
 ---
 
